@@ -64,158 +64,182 @@ def exc_hook(type, value, tb):
     traceback.print_exception(type, value, tb)
 
 
-sys.excepthook = exc_hook
-
-argc = len(sys.argv)
-
-if argc < 2:
-    raise Exception("You have to specify the uWSGI stats socket")
-
-addr = sys.argv[1]
-sfamily = socket.AF_UNIX
-addr_tuple = addr
-if ':' in addr:
-    sfamily = socket.AF_INET
-    addr_parts = addr.split(':')
-    addr_tuple = (addr_parts[0], int(addr_parts[1]))
-
-freq = 3
-try:
-    freq = int(sys.argv[2])
-except:
-    pass
-
-screen = curses.initscr()
-curses.start_color()
-
-try:
-    # busy
-    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
-    # cheap
-    curses.init_pair(2, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
-    # pause
-    curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
-    # sig
-    curses.init_pair(4, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-except curses.error:
-    # the terminal doesn't support colors
-    pass
-
-screen.timeout(freq * 1000)
-atexit.register(game_over)
-
-try:
-    curses.curs_set(0)
-except:
-    pass
-screen.clear()
-
-
 def calc_percent(req, tot):
     if tot == 0:
         return 0.0
     return "%.2f" % ((100 * float(req)) / float(tot))
 
-try:
-    # busy
-    curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_GREEN)
-    # cheap
-    curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_MAGENTA)
-    # pause
-    curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_RED)
-    # sig
-    curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_YELLOW)
-except curses.error:
-    # the terminal doesn't support colors
-    pass
 
-# RPS calculation
-last_tot_time = time.time()
-last_reqnumber = 0
+def parse_hosts(hosts):
+    """ returns tuples of host and ports
 
-last_hits_per_cache = defaultdict(int)
-last_miss_per_cache = defaultdict(int)
+    :param list|str hosts:
+    :return: list of tuples (host, port)
+    """
+    if isinstance(hosts, basestring):
+        hosts = [hosts]
 
-while True:
-    screen.clear()
-    js = ''
+    host_port_tuple_set = set()
+    for host in hosts:
+        addr = host
+        if ':' in host:
+            addr_parts = host.split(':')
+            addr = (addr_parts[0], int(addr_parts[1]))
+        host_port_tuple_set.add(addr)
 
-    try:
-        s = socket.socket(sfamily, socket.SOCK_STREAM)
-        s.connect(addr_tuple)
+    return host_port_tuple_set
 
-        while True:
-            data = s.recv(4096)
-            if len(data) < 1:
-                break
-            js += data.decode('utf8')
-    except:
-        raise Exception("unable to get uWSGI statistics")
 
-    dd = json.loads(js)
+def load_stats(hosts):
+    """ Load uwsgi statistics from *hosts*
 
-    uversion = ''
-    if 'version' in dd:
-        uversion = '-' + dd['version']
+    :param set hosts: set of (host, port) tuples
+    :return: dict with host: statisticdata
+    :rtype: dict
+    """
+    stats = {}
+    sfamily = socket.AF_INET
+    for host in hosts:
+        try:
+            s = socket.socket(sfamily, socket.SOCK_STREAM)
+            s.connect(host)
+            js = ''
+            while True:
+                data = s.recv(4096)
+                if len(data) < 1:
+                    break
+                js += data.decode('utf8')
+            stats[host] = json.loads(js)
+        except Exception as e:
+            raise Exception("unable to get uWSGI statistics", e)
+        finally:
+            s.close()
+    return stats
 
-    if not 'listen_queue' in dd:
-        dd['listen_queue'] = 0
 
-    cwd = ""
-    if 'cwd' in dd:
-        cwd = "- cwd: %s" % dd['cwd']
+def merge_stats(stats):
+    final = {}
+    for host, stat in stats.iteritems():
+        for cache in stat['caches']:
+            name = cache['name']
+            if name not in final:
+                final[name] = {'hits': 0, 'miss': 0, 'items': 0, 'max_items': 0, 'full': 0}
+            tmp = final[name]
+            tmp['hits'] += cache['hits']
+            tmp['miss'] += cache['miss']
+            tmp['items'] += cache['items']
+            tmp['full'] += cache['full']
+            tmp['max_items'] = cache['max_items']
 
-    uid = ""
-    if 'uid' in dd:
-        uid = "- uid: %d" % dd['uid']
+    for cache in final.values():
+        cache['items'] /= len(stats)
+    return final
 
-    gid = ""
-    if 'gid' in dd:
-        gid = "- gid: %d" % dd['gid']
 
-    masterpid = ""
-    if 'pid' in dd:
-        masterpid = "- masterpid: %d" % dd['pid']
+def add_header(screen, last_reqnumber, dt, stats):
+    if isinstance(stats, dict):
+        tot = sum([worker['requests'] for host_stats in stats.values() for worker in host_stats['workers']])
+        tx = human_size(sum([worker['tx'] for host_stats in stats.values() for worker in host_stats['workers']]))
+    else:
+        tot = 0
+        tx = 0
 
-    screen.addstr(1, 0, "node: %s %s %s %s %s" % (socket.gethostname(), cwd, uid, gid, masterpid))
-    tot = sum([worker['requests'] for worker in dd['workers']])
-    dt = time.time() - last_tot_time
     total_rps = (tot - last_reqnumber) / dt
     last_reqnumber = tot
 
-    tx = human_size(sum([worker['tx'] for worker in dd['workers']]))
-    screen.addstr(0, 0, "uwsgi%s - %s - req: %d - RPS: %d - lq: %d - tx: %s" % (uversion, time.ctime(), tot, int(round(total_rps)), dd['listen_queue'], tx))
-    rows = [("NAME", "HITS", "MISS", "HITS/s", "MISS/s", "ITEMS", "MAXITEMS", "H/M RAT", "FULL")]
-    for cache in dd['caches']:
-        ratio = calc_percent(cache['hits'], cache['hits'] + cache['miss'])
-        hits_per_s = (cache['hits'] - last_hits_per_cache[cache['name']]) / dt
-        miss_per_s = (cache['miss'] - last_miss_per_cache[cache['name']]) / dt
-        last_hits_per_cache[cache['name']] = cache['hits']
-        last_miss_per_cache[cache['name']] = cache['miss']
-        rows.append((cache['name'], cache['hits'], cache['miss'], hits_per_s, miss_per_s, cache['items'], cache['max_items'], ratio, cache['full']))
+    screen.addstr(0, 0, "Requests: %d - RPS: %d - tx: %s - hosts: %d" % (tot, int(round(total_rps)), tx, len(stats)))
 
+    return last_reqnumber
+
+if __name__ == '__main__':
+    sys.excepthook = exc_hook
+
+    argc = len(sys.argv)
+
+    if argc < 2:
+        raise Exception("You have to specify the uWSGI stats socket")
+
+    addr = sys.argv[1:]
+    hosts = parse_hosts(addr)
+
+    freq = 3
+    try:
+        freq = int(sys.argv[2])
+    except:
+        pass
+
+    screen = curses.initscr()
+    curses.start_color()
+
+    screen.timeout(freq * 1000)
+    atexit.register(game_over)
+
+    try:
+        curses.curs_set(0)
+    except:
+        pass
+    screen.clear()
+
+    try:
+        # busy
+        curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_GREEN)
+        # cheap
+        curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_MAGENTA)
+        # pause
+        curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_RED)
+        # sig
+        curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_YELLOW)
+    except curses.error:
+        # the terminal doesn't support colors
+        pass
+
+    # RPS calculation
     last_tot_time = time.time()
+    last_reqnumber = 0
 
-    col_paddings = []
-    for i in range(len(rows[0])):
-        col_paddings.append(get_max_width(rows, i))
+    last_hits_per_cache = defaultdict(int)
+    last_miss_per_cache = defaultdict(int)
 
-    pos = 2
-    # heading
-    heading = rows.pop(0)
-    screen.addstr(pos, 0, reduce(lambda x, y: x + str(heading[y]).ljust(col_paddings[y] + 2), range(len(heading)), ""), curses.A_BOLD)
-    pos = 3
+    while True:
+        screen.clear()
 
-    for row in rows:
-        screen.addstr(pos, 0, "")
-        for i in range(len(row)):
-            screen.addstr(format_num(row[i]).ljust(col_paddings[i] + 2))
-        pos += 1
+        stats = load_stats(hosts)
+        merged_stats = merge_stats(stats)
 
-    screen.refresh()
-    s.close()
+        dt = time.time() - last_tot_time
+        last_reqnumber = add_header(screen, last_reqnumber, dt, stats)
 
-    ch = screen.getch()
-    if ch == ord('q'):
-        game_over()
-        break
+        rows = [("NAME", "HITS", "MISS", "HITS/s", "MISS/s", "ITEMS", "MAXITEMS", "H/M RAT", "FULL")]
+        for name, cache in merged_stats.iteritems():
+            ratio = calc_percent(cache['hits'], cache['hits'] + cache['miss'])
+            hits_per_s = (cache['hits'] - last_hits_per_cache[name]) / dt
+            miss_per_s = (cache['miss'] - last_miss_per_cache[name]) / dt
+            last_hits_per_cache[name] = cache['hits']
+            last_miss_per_cache[name] = cache['miss']
+            rows.append((name, cache['hits'], cache['miss'], hits_per_s, miss_per_s, cache['items'], cache['max_items'], ratio, cache['full']))
+
+        last_tot_time = time.time()
+
+        col_paddings = []
+        for i in range(len(rows[0])):
+            col_paddings.append(get_max_width(rows, i))
+
+        pos = 1
+        # heading
+        heading = rows.pop(0)
+        screen.addstr(pos, 0, reduce(lambda x, y: x + str(heading[y]).ljust(col_paddings[y] + 2), range(len(heading)), ""), curses.A_BOLD)
+        pos = 2
+
+        for row in rows:
+            screen.addstr(pos, 0, "")
+            for i in range(len(row)):
+                screen.addstr(format_num(row[i]).ljust(col_paddings[i] + 2))
+            pos += 1
+
+        screen.refresh()
+        #s.close()
+
+        ch = screen.getch()
+        if ch == ord('q'):
+            game_over()
+            break
