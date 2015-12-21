@@ -12,4 +12,7 @@ setup(
     description='Top like utility for uwsgi caches',
     keywords = ['uwsgi', 'cache', 'top'],
     classifiers = [],
+    install_requires = [
+        'six',
+    ],
 )
