@@ -12,6 +12,7 @@ import atexit
 import sys
 import traceback
 from collections import defaultdict
+from six.moves import reduce
 
 need_reset = True
 screen = None
